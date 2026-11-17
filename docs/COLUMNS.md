@@ -53,6 +53,6 @@ _Train the same method twice on the same split, once with first-bin columns only
 
 | Run | Columns | Split | AUC on the proof period |
 |---|---|---|---|
-| A | First bin only | Time ||
-| B | All three bins | Time ||
-| C | First bin only | Random ||
+| A | First bin only | Time |0.7876|
+| B | All three bins | Time |1.00|
+| C | First bin only | Random |0.8626|

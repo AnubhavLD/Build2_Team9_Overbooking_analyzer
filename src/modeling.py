@@ -1,49 +1,62 @@
+
+"""Two methods: the client's flat rule and an XGBoost cancellation model.
+Both turn a night's bookings into 'expected cancellations'; recommend() turns that into rooms to oversell."""
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.model_selection import train_test_split
+
+from features import encode
 
 SEED = 42
 POOL = True
-# The script will test the client's current flat rule against your model
-METHODS = ["flat", "xgboost"] 
+METHODS = ["flat", "xgboost"]
+
+# Settings tried on the CHOOSE period (never on the proof period).
+# flat   : rooms of safety buffer subtracted from (rate x bookings)
+# xgboost: how many 'spreads' (standard deviations) below the expected cancellations we dare to sell
+SETTINGS = {
+    "flat": list(range(0, 41)),
+    "xgboost": [round(z, 2) for z in np.arange(0.0, 6.01, 0.25)],
+}
+
 
 def fit_methods(train):
-    """Train the model on historical data and return it for backtesting."""
-    features = ['hotel', 'distribution_channel', 'is_repeated_guest', 'previous_cancellations', 'previous_bookings_not_canceled']
-    X = pd.get_dummies(train[features])
-    y = train['is_canceled']
+    """Fit every method on the training period only and return them in a dict."""
+    train = train.sort_values("arrival_date")
+    X = encode(train)
+    y = train["is_canceled"].astype(int)
 
-    # Train XGBoost with your previous settings
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=500, learning_rate=0.1, max_depth=5, 
-        eval_metric='logloss', early_stopping_rounds=20, random_state=SEED
+    # Early stopping needs a validation slice: use the LAST 20% of the training period (time-ordered),
+    # so the model is never tuned on a random mix of past and future.
+    cut = int(len(train) * 0.8)
+    X_t, X_v, y_t, y_v = X.iloc[:cut], X.iloc[cut:], y.iloc[:cut], y.iloc[cut:]
+
+    model = xgb.XGBClassifier(
+        n_estimators=500, learning_rate=0.1, max_depth=5, eval_metric="logloss",
+        early_stopping_rounds=20, random_state=SEED,
     )
-    
-    # Isolate a small validation set purely for early stopping during training
-    X_t, X_v, y_t, y_v = train_test_split(X, y, test_size=0.2, random_state=SEED)
-    xgb_model.fit(X_t, y_t, eval_set=[(X_v, y_v)], verbose=False)
+    model.fit(X_t, y_t, eval_set=[(X_v, y_v)], verbose=False)
 
     return {
-        "flat": None, # The baseline rule doesn't need a model object
-        "xgboost": {"model": xgb_model, "columns": X.columns}
+        "flat": {"rate": float(y.mean())},                       # client's average cancellation rate
+        "xgboost": {"model": model, "columns": list(X.columns)},
     }
 
-def predict(method, model_obj, rows):
-    """Generate cancellation probabilities for the backtest."""
-    if method == "flat":
-        # The client's historical average cancellation rate is ~27%
-        return np.full(len(rows), 0.27)
-    
-    if method == "xgboost":
-        features = ['hotel', 'distribution_channel', 'is_repeated_guest', 'previous_cancellations', 'previous_bookings_not_canceled']
-        X = pd.get_dummies(rows[features])
-        
-        # Ensure the live columns perfectly match the training columns
-        X = X.reindex(columns=model_obj["columns"], fill_value=0)
-        
-        return model_obj["model"].predict_proba(X)[:, 1]
 
-def recommend(expected_cancellations, buffer):
-    """The client's business rule: Expected cancellations minus the safety buffer."""
-    return np.maximum(0, np.floor(expected_cancellations - buffer))
+def predict(method, model_obj, rows):
+    """Probability that each booking cancels, one value per row, same order as rows."""
+    if method == "flat":
+        return np.full(len(rows), model_obj["rate"])
+    if method == "xgboost":
+        X = encode(rows, model_obj["columns"])
+        return model_obj["model"].predict_proba(X)[:, 1]
+    raise ValueError(f"unknown method {method}")
+
+
+def recommend(method, nights, setting):
+    """Rooms to oversell on each night (whole numbers, zero or more)."""
+    if method == "flat":
+        k = np.floor(nights["expected"] - setting)
+    else:
+        k = np.floor(nights["expected"] - setting * nights["spread"])
+    return np.maximum(0, k).astype(int).to_numpy()
